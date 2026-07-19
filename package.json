@@ -1,0 +1,24 @@
+{
+    "name": "@ipota/bgm-manager",
+    "version": "1.0.3",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "import": "./dist/index.js",
+            "types": "./dist/index.d.ts"
+        }
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "tsc",
+        "update": "tsc && npm version patch && npm publish",
+        "first": "tsc && npm publish --access public"
+    },
+    "devDependencies": {
+        "typescript": "^5.8.0"
+    }
+}
