@@ -5,6 +5,8 @@ export class BgmManager {
     fadeGain;
     currentBgm = undefined;
     currentBgmSrc = undefined;
+    // load / crossfadeTo のたびに進める。読み込み中に呼ばれた古いクロスフェードを見分ける
+    crossfadeToken = 0;
     // ── ライフサイクル ───────────────────────────────────────────────────────
     constructor() {
         this.ctx = new AudioContext();
@@ -16,12 +18,56 @@ export class BgmManager {
     }
     /** 音声ファイルを読み込む。再生は play() を呼ぶまで始まらない */
     async load(params) {
+        this.crossfadeToken++;
         this.currentBgm?.stop();
         this.fadeGain.gain.cancelScheduledValues(0);
         this.fadeGain.gain.value = 1;
-        this.currentBgm = new Bgm(this.ctx, this.fadeGain);
+        this.ctx.suspend();
+        const bgm = new Bgm(this.ctx, this.fadeGain);
+        this.currentBgm = bgm;
         this.currentBgmSrc = params.src;
-        await this.currentBgm.load(params);
+        await bgm.load(params);
+        // 読み込み中に別のload()が呼ばれた。この曲は鳴らさずに止める
+        if (this.currentBgm !== bgm)
+            bgm.stop();
+    }
+    /**
+     * 再生中の曲を seconds 秒かけてフェードアウトさせながら、新しい曲を同じ秒数でフェードインする。
+     * 停止中なら曲を入れ替えて、フェードインだけを行う。
+     * 読み込み中にもう一度呼ぶと、先の呼び出しは捨てられる(最後の呼び出しだけが鳴る)。
+     * 同じ曲が再生中なら、何も鳴らし直さない(読み込み中の別の曲があれば、それは取り消す)
+     */
+    async crossfadeTo(params, seconds) {
+        if (this.ctx.state !== "running") {
+            await this.load(params);
+            await this.fadeIn(seconds);
+            return;
+        }
+        // 読み込み中の別の曲があれば、同じ曲が再生中でも取り消す(A→B→Aと素早く要求されたとき、Bが後から鳴らないようにする)
+        const token = ++this.crossfadeToken;
+        if (this.currentBgmSrc === params.src)
+            return;
+        const incomingFade = this.ctx.createGain();
+        incomingFade.gain.value = 0.001;
+        incomingFade.connect(this.gain);
+        const incoming = new Bgm(this.ctx, incomingFade);
+        await incoming.load(params);
+        // 読み込み中に別の曲が要求された。この曲は鳴らさずに捨てる
+        if (token !== this.crossfadeToken) {
+            incoming.stop();
+            incomingFade.disconnect();
+            return;
+        }
+        const outgoing = this.currentBgm;
+        const outgoingFade = this.fadeGain;
+        this.currentBgm = incoming;
+        this.currentBgmSrc = params.src;
+        this.fadeGain = incomingFade;
+        this.ramp(outgoingFade, 0.001, seconds);
+        this.ramp(incomingFade, 1, seconds);
+        await new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+        outgoing?.stop();
+        outgoingFade.disconnect();
     }
     getCurrentBgmSrc() {
         return this.currentBgmSrc;
@@ -55,12 +101,23 @@ export class BgmManager {
     /** seconds 秒かけてボリュームを target まで変化させる */
     fadeTo(target, seconds) {
         this.assertBgmLoaded();
-        const now = this.ctx.currentTime;
-        const current = this.fadeGain.gain.value; // 進行中のランプがあっても実際の現在値が取れる
-        this.fadeGain.gain.cancelScheduledValues(now);
-        this.fadeGain.gain.setValueAtTime(current, now); // ここで明示的に固定するのがポイント
-        this.fadeGain.gain.linearRampToValueAtTime(target, now + seconds);
+        // 停止中はcurrentTimeが進まないのでフェードも止まったままになり、
+        // 後でplay()された瞬間に古いフェードの続きが聞こえてしまう。
+        // 停止中はどうせ何も聞こえないので、待たずに目標の音量にしておく
+        if (this.ctx.state !== "running") {
+            this.fadeGain.gain.cancelScheduledValues(0);
+            this.fadeGain.gain.value = target;
+            return Promise.resolve();
+        }
+        this.ramp(this.fadeGain, target, seconds);
         return new Promise((resolve) => setTimeout(resolve, seconds * 1000));
+    }
+    ramp(node, target, seconds) {
+        const now = this.ctx.currentTime;
+        const current = node.gain.value; // 進行中のランプがあっても実際の現在値が取れる
+        node.gain.cancelScheduledValues(now);
+        node.gain.setValueAtTime(current, now); // ここで明示的に固定するのがポイント
+        node.gain.linearRampToValueAtTime(target, now + seconds);
     }
     // ── ボリューム ────────────────────────────────────────────────────────────
     setVolume(volume) {
@@ -116,7 +173,6 @@ class Bgm {
         this.destination = destination;
     }
     async load({ src, loopStart, loopEnd, trackVolume = 1 }) {
-        this.ctx.suspend();
         this.trackGain = this.ctx.createGain();
         this.trackGain.gain.value = trackVolume;
         // 渡された destination (ManagerのfadeGain) に直接繋ぐ
